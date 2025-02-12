@@ -1,0 +1,36 @@
+name: Trigger a workflow_dispatch event
+
+inputs:
+  repository:
+    description: The name and owner of the repository with the dispatch (owner/repo)
+    required: true
+  branch:
+    description: The name of the branch which should be triggered
+    default: main
+  workflow_filename:
+    description: The filename of the file in .github/workflows with workflow_dispatch event
+    required: true
+  workflow_inputs:
+    description: Inputs to pass to the workflow. Must be a JSON encoded string
+    default: ''
+  github_token:
+    description: GitHub Personal Access Token (PAT)
+    required: true
+
+runs:
+  using: composite
+  steps:
+  - name: Trigger an event
+    shell: sh
+    run: |
+      curl \
+        --request POST \
+        --header "Accept: application/vnd.github.v3+json" \
+        --header "Authorization: token ${{ inputs.github_token }}" \
+        --url https://api.github.com/repos/${{ inputs.repository }}/actions/workflows/${{ inputs.workflow_filename }}/dispatches \
+        --data @- <<'EOF'
+      {
+        "ref": "${{ inputs.branch }}",
+        "inputs": ${{ inputs.workflow_inputs || '{}' }}
+      }
+      EOF
