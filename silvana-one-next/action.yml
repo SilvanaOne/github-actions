@@ -34,6 +34,7 @@ runs:
       cat > .npmrc <<-EOF
         //npm.pkg.github.com/:_authToken=${{ inputs.github_token }}
         @SilvanaOne:registry=https://npm.pkg.github.com
+        @staketab:registry=https://npm.pkg.github.com
       EOF
 
   - name: Setup SSH Connection
