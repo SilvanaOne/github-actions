@@ -1,0 +1,159 @@
+name: Frontend Deploy Next.js SSH
+
+inputs:
+  webroot:
+    description: The root directory of the web server that will be used to search for a file
+    required: true
+  pm2_app_name:
+    description: PM2 application name to restart
+    required: true
+  ssh_hostname:
+    description: SSH hostname
+    required: true
+  ssh_username:
+    description: SSH username
+    required: true
+  ssh_key:
+    description: SSH private key
+    required: true
+  ssh_port:
+    description: SSH port
+    default: '22'
+  keep_source_maps:
+    description: Keep JavaScript Source Maps
+    default: true
+  nodejs_version:
+    description: Node.js version (used for both CI build and server)
+    default: '20'
+  github_token:
+    description: GitHub Personal Access Token (PAT)
+    required: true
+
+runs:
+  using: composite
+  steps:
+  - name: Setup Node.js (${{ inputs.nodejs_version }})
+    uses: actions/setup-node@v3
+    with:
+      node-version: ${{ inputs.nodejs_version }}
+      cache: npm
+    
+  - name: Login to GitHub Packages
+    shell: sh
+    run: |
+      cat > .npmrc <<-EOF
+        //npm.pkg.github.com/:_authToken=${{ inputs.github_token }}
+        @staketab:registry=https://npm.pkg.github.com
+      EOF
+
+  - name: Setup SSH Connection
+    shell: sh
+    run: |
+      mkdir -p $HOME/.ssh && chmod 700 $HOME/.ssh
+      echo "${{ inputs.ssh_key }}" > $HOME/.ssh/id_rsa
+      chmod 600 $HOME/.ssh/id_rsa
+      ssh-keyscan -p ${{ inputs.ssh_port }} ${{ inputs.ssh_hostname }} >> $HOME/.ssh/known_hosts 2>/dev/null
+      
+  - name: Install NPM dependencies
+    shell: bash
+    run: |
+      if ! npm ci; then
+        echo "npm ci failed, retrying with npm install --legacy-peer-deps..."
+        npm install --legacy-peer-deps
+      fi
+    env:
+      GITHUB_TOKEN: ${{ inputs.github_token }}
+
+  - name: Build Next.js project
+    shell: sh
+    run: npm run build
+    env:
+      CI: 'false'
+
+  - name: Deploy to remote server
+    shell: sh
+    run: |
+      # Sync .next directory
+      rsync \
+        --archive \
+        --verbose \
+        --human-readable \
+        --delete-before \
+        ${{ inputs.keep_source_maps == 'false' && '--exclude="*.map"' || '' }} \
+        -e "ssh -p ${{ inputs.ssh_port }}" \
+        .next/ ${{ inputs.ssh_username }}@${{ inputs.ssh_hostname }}:${{ inputs.webroot }}/.next/
+
+      # Sync public directory if exists
+      if [ -d "public" ]; then
+        rsync \
+          --archive \
+          --verbose \
+          --human-readable \
+          -e "ssh -p ${{ inputs.ssh_port }}" \
+          public/ ${{ inputs.ssh_username }}@${{ inputs.ssh_hostname }}:${{ inputs.webroot }}/public/
+      fi
+
+      # Sync package.json and next.config.js for runtime
+      rsync \
+        --archive \
+        --verbose \
+        -e "ssh -p ${{ inputs.ssh_port }}" \
+        package.json ${{ inputs.ssh_username }}@${{ inputs.ssh_hostname }}:${{ inputs.webroot }}/
+
+      if [ -f "next.config.js" ]; then
+        rsync -e "ssh -p ${{ inputs.ssh_port }}" next.config.js ${{ inputs.ssh_username }}@${{ inputs.ssh_hostname }}:${{ inputs.webroot }}/
+      fi
+
+      if [ -f "next.config.mjs" ]; then
+        rsync -e "ssh -p ${{ inputs.ssh_port }}" next.config.mjs ${{ inputs.ssh_username }}@${{ inputs.ssh_hostname }}:${{ inputs.webroot }}/
+      fi
+
+      # Sync .env file if exists
+      if [ -f ".env" ]; then
+        rsync -e "ssh -p ${{ inputs.ssh_port }}" .env ${{ inputs.ssh_username }}@${{ inputs.ssh_hostname }}:${{ inputs.webroot }}/
+      fi
+
+  - name: Setup Node.js on server and restart PM2
+    shell: bash
+    run: |
+      ssh -p ${{ inputs.ssh_port }} ${{ inputs.ssh_username }}@${{ inputs.ssh_hostname }} 'bash -s' << 'ENDSSH'
+        set -e
+
+        # Install nvm if not exists
+        if [ ! -d "$HOME/.nvm" ]; then
+          echo "Installing nvm..."
+          curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+        fi
+
+        # Load nvm
+        export NVM_DIR="$HOME/.nvm"
+        [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+
+        # Install Node.js if not exists
+        if ! nvm ls ${{ inputs.nodejs_version }} > /dev/null 2>&1; then
+          echo "Installing Node.js ${{ inputs.nodejs_version }}..."
+          nvm install ${{ inputs.nodejs_version }}
+        fi
+
+        nvm use ${{ inputs.nodejs_version }}
+
+        # Install PM2 globally if not exists
+        if ! command -v pm2 &> /dev/null; then
+          echo "Installing PM2..."
+          npm install -g pm2
+        fi
+
+        # Install production dependencies
+        cd ${{ inputs.webroot }}
+        npm install --omit=dev --legacy-peer-deps
+
+        # Start or restart PM2 app
+        if pm2 describe ${{ inputs.pm2_app_name }} > /dev/null 2>&1; then
+          echo "Restarting ${{ inputs.pm2_app_name }}..."
+          pm2 restart ${{ inputs.pm2_app_name }}
+        else
+          echo "Starting new PM2 app: ${{ inputs.pm2_app_name }}..."
+          pm2 start npm --name "${{ inputs.pm2_app_name }}" --cwd ${{ inputs.webroot }} -- start
+          pm2 save
+        fi
+      ENDSSH
